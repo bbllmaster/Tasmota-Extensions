@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>通用规则面板</title>
+<style>
+body{font-family:sans-serif;max-width:880px;margin:24px auto;padding:0 12px;background:#f5f6f8}
+h2{color:#333}
+.toolbar{display:flex;gap:10px;margin:16px 0;align-items:center;flex-wrap:wrap}
+.toolbar button,.toolbar a{padding:9px 14px;border:none;border-radius:6px;background:#333;color:#fff;cursor:pointer;font-size:14px;text-decoration:none}
+.toolbar .primary{background:#1FA3EC}
+.toolbar .back{background:#fff;color:#333;border:1px solid #ccc}
+#status{color:#888;font-size:13px;margin-left:8px}
+.row{display:flex;gap:6px;margin:8px 0;align-items:center;flex-wrap:wrap}
+.row select,.row input{padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+.row .tpl{width:120px;background:#fafafa}
+.row .trigger{flex:1;min-width:220px}
+.row .cmd{flex:1;min-width:220px}
+.row .del{min-width:54px;padding:8px 6px;border:none;border-radius:6px;background:#e74c3c;color:#fff;cursor:pointer}
+.row .lbl{color:#999;font-size:12px;flex:0 0 auto}
+.hint{color:#999;font-size:12px;margin-top:14px;line-height:1.7}
+</style></head>
+<body>
+<h2>通用规则面板</h2>
+<div class="toolbar">
+<a class="back" href="/">← 返回设备主页</a>
+<button onclick="addRow(null)">＋ 添加规则</button>
+<button onclick="loadAll()">读取规则</button>
+<button class="primary" onclick="saveAll()">保存并生效</button>
+<span id="status"></span>
+</div>
+<div id="list"></div>
+<div class="hint">
+每条规则 = 触发器 ON &lt;触发事件&gt; + 命令 DO &lt;任意 Tasmota 命令&gt;，拼为 <b>ON … DO … ENDON</b>。<br>
+支持所有触发器类型：按钮/开关、电源、系统事件、时间、MQTT、传感器、自定义 Event 等；模板下拉仅作快捷填充，可直接编辑。<br>
+命令支持所有 Tasmota 命令（publish / Power / Backlog / Var1 / RuleTimer 等），可用 %value% 引用触发值。<br>
+保存后立即生效，写入 Rule1/2/3（会整体重写这三个槽）。<b>注意：与 /btns 按钮面板共用同一套规则槽，请勿在两个页面分别保存。</b><br>
+示例：触发器 <b>Time#Minute=241</b> + 命令 <b>publish cmnd/tasmota_fy1_81743B/POWER TOGGLE</b> → 每天 04:01 发送 TOGGLE。
+</div>
+<script>
+var rules = [];
+var TRIGGERS = [
+  ['Button1#Action=SINGLE', '按钮短按 Button1'],
+  ['Button1#Action=DOUBLE', '按钮双击 Button1'],
+  ['Button1#Action=LONG', '按钮长按 Button1'],
+  ['Button1#State', '按钮状态变化'],
+  ['Switch1#State', '开关状态变化'],
+  ['Power1#State=1', '继电器1 开启'],
+  ['Power1#State=0', '继电器1 关闭'],
+  ['Power1#Boot', '开机时(早于系统就绪)'],
+  ['System#Boot', '系统启动完成'],
+  ['System#Init', '系统初始化前'],
+  ['Mqtt#Connected', 'MQTT 连接成功'],
+  ['Wifi#Connected', 'Wi-Fi 连接成功'],
+  ['Time#Minute', '每分钟'],
+  ['Time#Minute=241', '每天 04:01'],
+  ['Rules#Timer=1', '规则定时器1 到期'],
+  ['Event#event', '自定义事件 Event'],
+  ['Analog#A0<400', '模拟输入低于 400'],
+  ['Energy#Power>100', '功率超过 100W'],
+  ['DS18B20#Temperature<20', '温度低于 20 度'],
+  ['Tele-DS18B20#Temperature', '遥测周期上报温度']
+];
+var CMDS = [
+  ['publish cmnd/tasmota_xxx/POWER TOGGLE', '发布 MQTT'],
+  ['publish stat/xxx/EVENT %value%', '发布带触发值'],
+  ['Power1 TOGGLE', '切换继电器1'],
+  ['Power1 ON', '开启继电器1'],
+  ['Power1 OFF', '关闭继电器1'],
+  ['Power %value%', '跟随触发值'],
+  ['Backlog Power1 TOGGLE; RuleTimer1 30', '多命令组合'],
+  ['Var1 %value%', '存到变量 Var1'],
+  ['Mem1 %value%', '存到记忆变量 Mem1'],
+  ['RuleTimer1 30', '启动规则定时器1']
+];
+function status(s){document.getElementById('status').textContent=s;}
+function cmnd(cmd, method){
+  var opt = {method: method || 'GET'};
+  if(method === 'POST'){
+    opt.headers = {'Content-Type':'application/x-www-form-urlencoded'};
+    opt.body = 'cmnd=' + encodeURIComponent(cmd);
+  }
+  return fetch(method === 'POST' ? '/cm' : '/cm?cmnd=' + encodeURIComponent(cmd), opt).then(function(r){ return r.json(); });
+}
+// ---- 解析通用规则槽文本 ----
+function parseGenericRule(text){
+  var m = text.match(/^ON\s+([\s\S]*?)\s+DO\s+([\s\S]*?)\s+(?:ENDON|BREAK)\s*$/i);
+  if(!m) return null;
+  var t = m[1].trim(), c = m[2].trim();
+  if(t && c) return {trigger: t, command: c};
+  return null;
+}
+function parseGenericSlot(slot){
+  var out = [];
+  var parts = slot.split(/endon|break/i);
+  for(var i = 0; i < parts.length; i++){
+    var part = parts[i].trim();
+    if(!part) continue;
+    var m = part.match(/^ON\s+(.+?)\s+DO\s+(.+)$/i);
+    if(m){
+      var t = m[1].trim(), c = m[2].trim();
+      if(t && c) out.push({trigger: t, command: c});
+    }
+  }
+  return out;
+}
+function buildOne(r){ return 'ON ' + r.trigger + ' DO ' + r.command + ' ENDON'; }
+function tplSelect(opts, onPick){
+  var sel = document.createElement('select');
+  sel.className = 'tpl';
+  var o0 = document.createElement('option'); o0.value=''; o0.textContent='— 模板 —';
+  sel.appendChild(o0);
+  opts.forEach(function(p){
+    var o = document.createElement('option'); o.value = p[0]; o.textContent = p[1];
+    sel.appendChild(o);
+  });
+  sel.onchange = function(){ if(sel.value) onPick(sel.value); };
+  return sel;
+}
+// ---- 读取：依次查询 Rule1/2/3 ----
+function loadAll(){
+  rules = [];
+  var list = document.getElementById('list');
+  list.innerHTML = '';
+  status('读取中…');
+  var done = 0, found = 0;
+  for(var k = 1; k <= 3; k++){
+    (function(idx){
+      cmnd('Rule' + idx).then(function(res){
+        var key = 'Rule' + idx;
+        var slot = (res && res[key] && res[key].Rules) ? res[key].Rules : '';
+        if(slot){ parseGenericSlot(slot).forEach(function(r){ rules.push(r); }); }
+        done++; found += slot ? 1 : 0;
+        if(done === 3){
+          if(rules.length) rules.forEach(function(r){ addRow(r); });
+          status('已读取 ' + rules.length + ' 条规则（来自 ' + found + ' 个槽）');
+        }
+      }).catch(function(e){
+        done++;
+        if(done === 3) status('读取失败：' + e);
+      });
+    })(k);
+  }
+}
+// ---- 保存：分槽写入 + 启用 ----
+function saveAll(){
+  var rows = document.querySelectorAll('#list .row');
+  rules = [];
+  for(var k = 0; k < rows.length; k++){
+    var r = rows[k];
+    var t = {trigger:r.querySelector('.trigger').value.trim(), command:r.querySelector('.cmd').value.trim()};
+    if(t.trigger && t.command) rules.push(t);
+  }
+  if(!rules.length){
+    if(!confirm('当前列表为空，保存将清空设备上所有规则。确定继续？')){
+      status('已取消保存');
+      return;
+    }
+  }
+  var segs = [], cur = '';
+  rules.forEach(function(r){
+    var one = buildOne(r);
+    if(cur && cur.length + one.length + 1 > 480){ segs.push(cur); cur = one; }
+    else { cur = cur ? cur + ' ' + one : one; }
+  });
+  if(cur) segs.push(cur);
+  status('保存中…');
+  var chain = Promise.resolve();
+  for(var i = 0; i < 3; i++){
+    (function(idx){
+      if(idx < segs.length){
+        chain = chain
+          .then(function(){ return cmnd('Rule' + (idx+1) + ' ' + segs[idx], 'POST'); })
+          .then(function(){ return cmnd('Rule' + (idx+1) + ' 1', 'POST'); });
+      } else {
+        chain = chain.then(function(){ return cmnd('Rule' + (idx+1) + ' "', 'POST'); });
+      }
+    })(i);
+  }
+  chain.then(function(){
+    return cmnd('Rule1').then(function(res){
+      var s = (res && res.Rule1) ? ('State=' + res.Rule1.State + ' | ' + res.Rule1.Rules) : '';
+      status('已保存并生效：' + rules.length + ' 条规则；Rule1 → ' + s);
+    }).then(function(){ loadAll(); });
+  }).catch(function(e){ status('保存失败：' + e); });
+}
+function addRow(r){
+  r = r || {};
+  var list = document.getElementById('list');
+  var d = document.createElement('div'); d.className = 'row';
+  var tl = document.createElement('span'); tl.className='lbl'; tl.textContent='ON';
+  var tTpl = tplSelect(TRIGGERS, function(v){ d.querySelector('.trigger').value = v; });
+  var trig = document.createElement('input'); trig.className = 'trigger'; trig.value = r.trigger || ''; trig.placeholder = '触发器，如 Button1#Action=SINGLE';
+  var cl = document.createElement('span'); cl.className='lbl'; cl.textContent='DO';
+  var cTpl = tplSelect(CMDS, function(v){ d.querySelector('.cmd').value = v; });
+  var cmd = document.createElement('input'); cmd.className = 'cmd'; cmd.value = r.command || ''; cmd.placeholder = '命令，如 publish cmnd/xxx/POWER TOGGLE';
+  var del = document.createElement('button'); del.className = 'del'; del.textContent = '删除';
+  del.onclick = function(){ d.remove(); };
+  d.appendChild(tl); d.appendChild(tTpl); d.appendChild(trig); d.appendChild(cl); d.appendChild(cTpl); d.appendChild(cmd); d.appendChild(del);
+  list.appendChild(d);
+}
+// 页面打开时自动读取已有规则（避免未读取直接保存导致清空）
+loadAll();
+</script>
+</body></html>

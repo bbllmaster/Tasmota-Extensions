@@ -1,0 +1,8 @@
+{
+  "name": "Rules Panel",
+  "version": "0x1A000001",
+  "description": "Rules panel extension for Tasmota - button rules panel and generic rules panel",
+  "author": "Mika",
+  "min_tasmota": "0x0F000100",
+  "features": ""
+}
