@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>按钮规则面板</title>
+<style>
+body{font-family:sans-serif;max-width:780px;margin:24px auto;padding:0 12px;background:#f5f6f8}
+h2{color:#333}
+.toolbar{display:flex;gap:10px;margin:16px 0;align-items:center;flex-wrap:wrap}
+.toolbar button,.toolbar a{padding:9px 14px;border:none;border-radius:6px;background:#333;color:#fff;cursor:pointer;font-size:14px;text-decoration:none}
+.toolbar .primary{background:#1FA3EC}
+.toolbar .back{background:#fff;color:#333;border:1px solid #ccc}
+#status{color:#888;font-size:13px;margin-left:8px}
+.row{display:flex;gap:6px;margin:8px 0;align-items:center;flex-wrap:wrap}
+.row input,.row select{padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+.row .dev{width:110px}
+.row .act{width:110px}
+.row .topic{flex:1;min-width:200px}
+.row .payload{width:130px}
+.row .del{min-width:54px;padding:8px 6px;border:none;border-radius:6px;background:#e74c3c;color:#fff;cursor:pointer}
+.hint{color:#999;font-size:12px;margin-top:14px;line-height:1.7}
+</style></head>
+<body>
+<h2>按钮规则面板</h2>
+<div class="toolbar">
+<a class="back" href="/">← 返回设备主页</a>
+<button onclick="addRow(null)">＋ 添加规则</button>
+<button onclick="loadAll()">读取规则</button>
+<button class="primary" onclick="saveAll()">保存并生效</button>
+<span id="status"></span>
+</div>
+<div id="list"></div>
+<div class="hint">页面直接调用设备命令接口（/cm）读写原生规则槽 Rule1/2/3：读取=查询各槽，保存=写入并启用。<br>
+每条规则 = 物理按钮/开关（Button1、Switch1…）+ 触发动作 + MQTT topic + 消息内容。<br>
+保存后立即生效；规则存储在设备 flash 中，重启不丢失。<br>
+示例：Button1 + SINGLE + cmnd/tasmota_fy1_81743B/POWER + TOGGLE → 短按 Button1 发布 TOGGLE。</div>
+<script>
+var rules = [];
+function status(s){document.getElementById('status').textContent=s;}
+function cmnd(cmd, method){
+  var opt = {method: method || 'GET'};
+  if(method === 'POST'){
+    opt.headers = {'Content-Type':'application/x-www-form-urlencoded'};
+    opt.body = 'cmnd=' + encodeURIComponent(cmd);
+  }
+  return fetch(method === 'POST' ? '/cm' : '/cm?cmnd=' + encodeURIComponent(cmd), opt).then(function(r){ return r.json(); });
+}
+// ---- 解析规则槽文本（大小写不敏感：Tasmota 规则关键字为 ON/DO/ENDON）----
+function parseRule(text){
+  var m = text.match(/\s+DO\s+publish\s+/i);
+  if(!m) return null;
+  var i = m.index;
+  var head = text.slice(0, i);
+  var tail = text.slice(i + m[0].length).replace(/ endon/gi, '');
+  var h = head.split('#Action=');
+  if(h.length < 2) return null;
+  var dev = h[0].replace(/^ON\s+/i, '').replace(/ /g, '');
+  var act = h[1].replace(/ /g, '');
+  var tp = tail.split(' ').filter(function(x){ return x !== ''; });
+  if(!tp.length) return null;
+  var topic = tp[0];
+  var payload = tp.slice(1).join(' ');
+  if(payload.length >= 2 && payload.charAt(0) === '"' && payload.charAt(payload.length-1) === '"'){
+    payload = payload.slice(1, -1);
+  }
+  if(dev && act && topic) return {dev:dev, action:act, topic:topic, payload:payload};
+  return null;
+}
+function parseSlot(slot){
+  var out = [];
+  slot.split(/endon\s+on/i).forEach(function(it){ var r = parseRule(it); if(r) out.push(r); });
+  return out;
+}
+function quote(p){ return p.indexOf(' ') >= 0 ? '"' + p + '"' : p; }
+function buildOne(r){ return 'on ' + r.dev + '#Action=' + r.action + ' do publish ' + r.topic + ' ' + quote(r.payload) + ' endon'; }
+// ---- 读取：依次查询 Rule1/2/3 ----
+function loadAll(){
+  rules = [];
+  var list = document.getElementById('list');
+  list.innerHTML = '';
+  status('读取中…');
+  var done = 0, found = 0;
+  for(var k = 1; k <= 3; k++){
+    (function(idx){
+      cmnd('Rule' + idx).then(function(res){
+        var key = 'Rule' + idx;
+        var slot = (res && res[key] && res[key].Rules) ? res[key].Rules : '';
+        if(slot){ parseSlot(slot).forEach(function(r){ rules.push(r); }); }
+        done++; found += slot ? 1 : 0;
+        if(done === 3){
+          if(rules.length) rules.forEach(function(r){ addRow(r); });
+          status('已读取 ' + rules.length + ' 条规则（来自 ' + found + ' 个槽）');
+        }
+      }).catch(function(e){
+        done++;
+        if(done === 3) status('读取失败：' + e);
+      });
+    })(k);
+  }
+}
+// ---- 保存：分槽写入 + 启用 ----
+function saveAll(){
+  var rows = document.querySelectorAll('#list .row');
+  rules = [];
+  for(var k = 0; k < rows.length; k++){
+    var r = rows[k];
+    var t = {dev:r.querySelector('.dev').value.trim(), action:r.querySelector('.act').value, topic:r.querySelector('.topic').value.trim(), payload:r.querySelector('.payload').value.trim()};
+    if(t.dev && t.topic && t.payload) rules.push(t);
+  }
+  if(!rules.length){
+    if(!confirm('当前列表为空，保存将清空设备上所有规则。确定继续？')){
+      status('已取消保存');
+      return;
+    }
+  }
+  var segs = [], cur = '';
+  rules.forEach(function(r){
+    var one = buildOne(r);
+    if(cur && cur.length + one.length + 1 > 480){ segs.push(cur); cur = one; }
+    else { cur = cur ? cur + ' ' + one : one; }
+  });
+  if(cur) segs.push(cur);
+  status('保存中…');
+  var chain = Promise.resolve();
+  for(var i = 0; i < 3; i++){
+    (function(idx){
+      if(idx < segs.length){
+        chain = chain
+          .then(function(){ return cmnd('Rule' + (idx+1) + ' ' + segs[idx], 'POST'); })
+          .then(function(){ return cmnd('Rule' + (idx+1) + ' 1', 'POST'); });
+      } else {
+        chain = chain.then(function(){ return cmnd('Rule' + (idx+1) + ' "', 'POST'); });
+      }
+    })(i);
+  }
+  chain.then(function(){
+    return cmnd('Rule1').then(function(res){
+      var s = (res && res.Rule1) ? ('State=' + res.Rule1.State + ' | ' + res.Rule1.Rules) : '';
+      status('已保存并生效：' + rules.length + ' 条规则；Rule1 → ' + s);
+    }).then(function(){ loadAll(); });
+  }).catch(function(e){ status('保存失败：' + e); });
+}
+function addRow(r){
+  r = r || {};
+  var list = document.getElementById('list');
+  var d = document.createElement('div'); d.className = 'row';
+  var dev = document.createElement('input'); dev.className = 'dev'; dev.value = r.dev || 'Button1'; dev.placeholder = 'Button1';
+  var act = document.createElement('select'); act.className = 'act';
+  ['SINGLE','DOUBLE','LONG'].forEach(function(a){
+    var o = document.createElement('option'); o.value = a; o.textContent = a;
+    if(a === (r.action || 'SINGLE')) o.selected = true;
+    act.appendChild(o);
+  });
+  var topic = document.createElement('input'); topic.className = 'topic'; topic.value = r.topic || ''; topic.placeholder = 'MQTT topic，如 cmnd/tasmota_fy1_81743B/POWER';
+  var payload = document.createElement('input'); payload.className = 'payload'; payload.value = r.payload || 'TOGGLE'; payload.placeholder = 'TOGGLE / ON / OFF';
+  var del = document.createElement('button'); del.className = 'del'; del.textContent = '删除';
+  del.onclick = function(){ d.remove(); };
+  d.appendChild(dev); d.appendChild(act); d.appendChild(topic); d.appendChild(payload); d.appendChild(del);
+  list.appendChild(d);
+}
+// 页面打开时自动读取已有规则（避免未读取直接保存导致清空）
+loadAll();
+</script>
+</body></html>
